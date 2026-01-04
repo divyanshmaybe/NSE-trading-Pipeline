@@ -1,0 +1,44 @@
+# Environment variables
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+nse/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+nse_monitor.log
+
+# Temporary files
+docs/
+*.tmp
+*.temp
+
+# Database
+*.db
+*.sqlite3
+
+# Processed data
+processed_announcements.json
+
+# Trading signals
+trading_signals.jsonl
