@@ -7,18 +7,20 @@ from datetime import datetime
 from typing import List, Dict
 from nse_sentiment import process_filing
 
-RELEVANT_FILE_TYPES = {
-    "Outcome of Board Meeting",
-    "Press Release",
-    "Appointment",
-    "Acquisition",
-    "Updates",
-    "Action(s) initiated or orders passed",
-    "Investor Presentation",
-    "Sale or Disposal",
-    "Bagging/Receiving of Orders/Contracts",
-    "Change in Director(s)",
-}
+def load_filing_types_from_csv(csv_path: str = "staticdata.csv") -> set:
+    try:
+        import pandas as pd
+        if not os.path.exists(csv_path):
+            return set()
+        df = pd.read_csv(csv_path)
+        if 'file type' not in df.columns:
+            return set()
+        filing_types = set(df['file type'].str.strip().str.lower())
+        return filing_types
+    except Exception as e:
+        return set()
+
+RELEVANT_FILE_TYPES = load_filing_types_from_csv()
 
 NSE_BASE_URL = "https://www.nseindia.com"
 NSE_API_URL = "https://www.nseindia.com/api/corporate-announcements?index=equities"

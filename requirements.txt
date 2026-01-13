@@ -1,4 +1,5 @@
 requests
+pandas
 PyPDF2
 langchain_google_genai
 brotli

@@ -14,18 +14,25 @@ import base64
 
 load_dotenv()
 
-RELEVANT_FILE_TYPES = {
-    "Outcome of Board Meeting": {"positive": True, "negative": True},
-    "Press Release": {"positive": True, "negative": False},
-    "Appointment": {"positive": True, "negative": True},
-    "Acquisition": {"positive": True, "negative": True},
-    "Updates": {"positive": True, "negative": True},
-    "Action(s) initiated or orders passed": {"positive": True, "negative": True},
-    "Investor Presentation": {"positive": True, "negative": True},
-    "Sale or Disposal": {"positive": True, "negative": True},
-    "Bagging/Receiving of Orders/Contracts": {"positive": True, "negative": True},
-    "Change in Director(s)": {"positive": True, "negative": True},
-}
+def load_relevant_file_types() -> Dict[str, Dict[str, bool]]:
+    try:
+        import pandas as pd
+        if not os.path.exists("staticdata.csv"):
+            return {}
+        df = pd.read_csv("staticdata.csv")
+        result = {}
+        for _, row in df.iterrows():
+            file_type = row['file type'].strip()
+            pos_impact = row['positive impct '].strip()
+            neg_impact = row['negtive impct'].strip()
+            positive = pos_impact != "" and pos_impact.lower() != "not applicable for this filing type"
+            negative = neg_impact != "" and neg_impact.lower() != "not applicable for this filing type"
+            result[file_type] = {"positive": positive, "negative": negative}
+        return result
+    except Exception:
+        return {}
+
+RELEVANT_FILE_TYPES = load_relevant_file_types()
 
 api_keys_str = os.getenv("GEMINI_API_KEYS", os.getenv("GEMINI_API_KEY", ""))
 GEMINI_API_KEYS = [key.strip() for key in api_keys_str.split(",") if key.strip()]
@@ -181,13 +188,35 @@ def fetch_stock_data(symbol: str, filing_time: str) -> str:
 def get_pos_impact(file_type: str, use_positive: bool) -> str:
     if not use_positive:
         return "not applicable for this filing type"
-    return "Positive impact expected"
+    try:
+        import pandas as pd
+        if not os.path.exists("staticdata.csv"):
+            return "Positive impact expected"
+        df = pd.read_csv("staticdata.csv")
+        match = df[df["file type"].str.lower() == file_type.lower()]
+        if not match.empty:
+            return str(match["positive impct "].values[0])
+        else:
+            return "Positive impact expected"
+    except Exception:
+        return "Positive impact expected"
 
 
 def get_neg_impact(file_type: str, use_negative: bool) -> str:
     if not use_negative:
         return "not applicable for this filing type"
-    return "Negative impact expected"
+    try:
+        import pandas as pd
+        if not os.path.exists("staticdata.csv"):
+            return "Negative impact expected"
+        df = pd.read_csv("staticdata.csv")
+        match = df[df["file type"].str.lower() == file_type.lower()]
+        if not match.empty:
+            return str(match["negtive impct"].values[0])
+        else:
+            return "Negative impact expected"
+    except Exception:
+        return "Negative impact expected"
 
 
 def load_prompt_config(prompt_file: str) -> dict:
