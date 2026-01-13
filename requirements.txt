@@ -1,0 +1,6 @@
+requests
+PyPDF2
+langchain_google_genai
+brotli
+brotlicffi
+python-dotenv

@@ -1,31 +1,19 @@
-# -*- coding: utf-8 -*-
-"""
-Simplified NSE Filings Sentiment Agent for WhatsApp Notifications
-
-This script processes NSE corporate filings, extracts text from PDFs,
-fetches stock data, and generates trading signals using LLM analysis.
-Sends actionable signals via WhatsApp notifications.
-"""
-
 import os
 import re
 import json
 import time
+import yaml
 from datetime import datetime
 from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage
 from PyPDF2 import PdfReader
-import pandas as pd
 import base64
 
-# Load environment variables
 load_dotenv()
 
-# Configuration
 RELEVANT_FILE_TYPES = {
     "Outcome of Board Meeting": {"positive": True, "negative": True},
     "Press Release": {"positive": True, "negative": False},
@@ -39,15 +27,35 @@ RELEVANT_FILE_TYPES = {
     "Change in Director(s)": {"positive": True, "negative": True},
 }
 
-# API Keys
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+api_keys_str = os.getenv("GEMINI_API_KEYS", os.getenv("GEMINI_API_KEY", ""))
+GEMINI_API_KEYS = [key.strip() for key in api_keys_str.split(",") if key.strip()]
 
-# Validate API key
-if not GEMINI_API_KEY:
-    print("[WARN] GEMINI_API_KEY not found in environment variables!")
-    print("[WARN] Please set it in .env file or export GEMINI_API_KEY=your_key")
-else:
-    print(f"[INFO] GEMINI_API_KEY loaded (length: {len(GEMINI_API_KEY)})")
+EXHAUSTED_KEYS_FILE = Path(__file__).parent / "exhausted_keys.json"
+
+def load_exhausted_keys():
+    """Load exhausted keys for today"""
+    try:
+        if EXHAUSTED_KEYS_FILE.exists():
+            with open(EXHAUSTED_KEYS_FILE, 'r') as f:
+                data = json.load(f)
+                today = datetime.now().strftime('%Y-%m-%d')
+                if data.get('date') == today:
+                    return set(data.get('exhausted_keys', []))
+    except Exception as e:
+        print(f"[WARN] Could not load exhausted keys: {e}")
+    return set()
+
+def save_exhausted_keys(exhausted_keys):
+    """Save exhausted keys for today"""
+    try:
+        data = {
+            'date': datetime.now().strftime('%Y-%m-%d'),
+            'exhausted_keys': list(exhausted_keys)
+        }
+        with open(EXHAUSTED_KEYS_FILE, 'w') as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"[WARN] Could not save exhausted keys: {e}")
 
 
 def map_filing_type(desc: str) -> str:
@@ -128,6 +136,31 @@ def download_pdf(url: str, filename: str) -> str:
             for chunk in response.iter_content(8192):
                 f.write(chunk)
 
+        # Quick validation: ensure file is non-empty and contains at least one PDF page
+        try:
+            full_path = docs_dir / temp_filename
+            if full_path.stat().st_size == 0:
+                print(f"[WARN] Downloaded PDF is empty: {temp_filename}")
+                try:
+                    full_path.unlink()
+                except:
+                    pass
+                return ""
+
+            reader = PdfReader(str(full_path))
+            num_pages = len(reader.pages) if hasattr(reader, 'pages') else 0
+            if num_pages == 0:
+                print(f"[WARN] Downloaded PDF has no pages: {temp_filename}")
+                try:
+                    full_path.unlink()
+                except:
+                    pass
+                return ""
+
+        except Exception as e:
+            print(f"[WARN] Could not validate PDF {temp_filename}: {e}")
+            # If validation fails, we still return the filename to allow caller decide
+
         return temp_filename
     except Exception as e:
         print(f"[ERROR] Failed to download PDF {filename}: {e}")
@@ -145,86 +178,108 @@ def fetch_stock_data(symbol: str, filing_time: str) -> str:
         return f"Current price: N/A, timestamp: {filing_time}"
 
 
-def get_pos_impact(file_type: str, use_positive: bool, static_data_path: str = "staticdata.csv") -> str:
-    """Get positive impact scenario"""
+def get_pos_impact(file_type: str, use_positive: bool) -> str:
     if not use_positive:
         return "not applicable for this filing type"
-
-    try:
-        if not os.path.exists(static_data_path):
-            return "not much specific"
-
-        staticdf = pd.read_csv(static_data_path)
-        match = staticdf[staticdf["file type"].str.lower() == file_type.lower()]
-
-        if not match.empty:
-            return str(match["positive impct "].values[0])
-        else:
-            return "not much specific"
-    except Exception as e:
-        print(f"Error reading static data: {e}")
-        return "not much specific"
+    return "Positive impact expected"
 
 
-def get_neg_impact(file_type: str, use_negative: bool, static_data_path: str = "staticdata.csv") -> str:
-    """Get negative impact scenario"""
+def get_neg_impact(file_type: str, use_negative: bool) -> str:
     if not use_negative:
         return "not applicable for this filing type"
+    return "Negative impact expected"
 
+
+def load_prompt_config(prompt_file: str) -> dict:
+    """Load prompt configuration from YAML file"""
     try:
-        if not os.path.exists(static_data_path):
-            return "not much specific"
-
-        staticdf = pd.read_csv(static_data_path)
-        match = staticdf[staticdf["file type"].str.lower() == file_type.lower()]
-
-        if not match.empty:
-            return str(match["negtive impct"].values[0])
-        else:
-            return "not much specific"
+        with open(prompt_file, 'r', encoding='utf-8') as f:
+            return yaml.safe_load(f)
     except Exception as e:
-        print(f"Error reading static data: {e}")
-        return "not much specific"
+        print(f"[ERROR] Failed to load prompt config {prompt_file}: {e}")
+        return None
+
+
+def try_api_call_with_fallback(model_func, *args, **kwargs):
+    """Try API call with multiple keys fallback, skipping known exhausted keys"""
+    exhausted_keys = load_exhausted_keys()
+
+    for i, api_key in enumerate(GEMINI_API_KEYS):
+        key_index = i + 1
+
+        # Skip keys known to be exhausted today
+        if api_key in exhausted_keys:
+            print(f"[API] Skipping exhausted key {key_index}, trying next...")
+            continue
+
+        try:
+            print(f"[API] Trying key {key_index}/{len(GEMINI_API_KEYS)}...")
+            kwargs['api_key'] = api_key
+            result = model_func(*args, **kwargs)
+
+            # If this key worked and we had skipped exhausted ones, save the working key index
+            # This helps start with the working key for future filings
+            if exhausted_keys:
+                save_exhausted_keys(exhausted_keys)
+                print(f"[API] Key {key_index} working, will start with this key for future filings")
+
+            return result
+
+        except Exception as e:
+            error_msg = str(e)
+            if "RESOURCE_EXHAUSTED" in error_msg or "quota" in error_msg.lower():
+                print(f"[API] Key {key_index} quota exhausted, marking as exhausted and trying next...")
+                exhausted_keys.add(api_key)
+                save_exhausted_keys(exhausted_keys)
+                continue
+            else:
+                # Non-quota error, re-raise
+                raise e
+
+    # All available keys exhausted
+    raise Exception("All available API keys exhausted or quota limits reached")
 
 
 def generate_trading_signal(pos_impact: str, neg_impact: str, stocktechdata: str, pdf_filename: str = "") -> dict:
     """
-    Generate trading signal using Gemini LLM
+    Generate trading signal using two-step Gemini LLM process.
+
+    In DRY_RUN mode (env var 'DRY_RUN' set) this returns a deterministic stub
+    result so the system can be tested without calling external LLM APIs.
     """
+    # Dry-run stub
+    if os.getenv('DRY_RUN', '').lower() in {'1', 'true', 'yes'}:
+        print('[DRY-RUN] generate_trading_signal: returning stubbed signal (no LLM call)')
+        # Simple heuristic: return BUY (1) so dry-run generates actionable signals
+        return {
+            "final_signal": 1,
+            "Confidence": 0.75,
+            "explanation": "Dry-run stub: simulated BUY signal for testing"
+        }
+
     try:
-        if not GEMINI_API_KEY:
-            return {"final_signal": 0, "Confidence": 0, "explanation": "API key not configured"}
+        if not GEMINI_API_KEYS:
+            return {"final_signal": 0, "Confidence": 0, "explanation": "No API keys configured"}
 
-        # Build prompt
-        prompt = f"""
-Analyze this NSE corporate filing and generate a trading signal.
+        # Load prompt configurations
+        generation_config = load_prompt_config("nse_signal_generation_prompt.yaml")
+        validation_config = load_prompt_config("nse_signal_validation_prompt.yaml")
 
-Stock Data: {stocktechdata}
-Positive Impact Scenario: {pos_impact}
-Negative Impact Scenario: {neg_impact}
+        if not generation_config or not validation_config:
+            return {"final_signal": 0, "Confidence": 0, "explanation": "Failed to load prompt configurations"}
 
-Based on the filing content, determine:
-1. Trading signal: 1 (BUY), -1 (SELL), or 0 (HOLD)
-2. Confidence level (0.0 to 1.0)
-3. Detailed explanation
+        # ===== STEP 1: SIGNAL GENERATION =====
+        print(f"[LLM-1] Generating initial signal with {generation_config['model']}...")
 
-Return ONLY JSON in this format:
-{{
-    "final_signal": 1,
-    "Confidence": 0.85,
-    "explanation": "Detailed analysis here..."
-}}
-"""
-
-        # Setup LLM
-        model = ChatGoogleGenerativeAI(
-            model="gemini-1.5-flash",
-            temperature=0.1,
-            api_key=GEMINI_API_KEY
+        # Build generation prompt
+        generation_prompt = generation_config['prompt_template'].format(
+            stocktechdata=stocktechdata,
+            pos_impact=pos_impact,
+            neg_impact=neg_impact
         )
 
-        # Prepare message
-        message_parts = [{"type": "text", "text": prompt}]
+        # Prepare message with PDF
+        message_parts = [{"type": "text", "text": generation_prompt}]
 
         # Attach PDF if available
         pdf_path = None
@@ -241,27 +296,226 @@ Return ONLY JSON in this format:
                         "mime_type": "application/pdf",
                         "base64": pdf_b64
                     })
-                    print(f"[INFO] PDF attached: {pdf_filename}")
+                    print(f"[INFO] PDF attached for generation: {pdf_filename}")
                 except Exception as e:
-                    print(f"[WARN] Failed to attach PDF: {e}")
+                    print(f"[WARN] Failed to attach PDF for generation: {e}")
 
-        # Get response
-        human_msg = HumanMessage(content=message_parts)
-        response = model.invoke([human_msg])
+        # Try configured model first, then fall back to sensible defaults if quota / 429 occurs
+        gen_primary = generation_config.get('model')
+        gen_fallbacks = generation_config.get('fallback_models', ["gemini-2.5-flash", "gemini-2.5", "gemini-2.0-flash"])
+        gen_models_to_try = [m for m in ([gen_primary] + gen_fallbacks) if m]
 
-        # Extract content
-        content = response.content if hasattr(response, 'content') else str(response)
+        gen_response = None
+        last_exc = None
+        used_gen_model = None
 
-        # Handle list format
-        if isinstance(content, list):
-            content = '\n'.join([block.get('text', '') if isinstance(block, dict) else str(block) for block in content])
+        # Validate PDF before attaching: ensure it has pages
+        pdf_attached = False
+        if pdf_path and pdf_path.exists():
+            try:
+                reader = PdfReader(str(pdf_path))
+                num_pages = len(reader.pages) if hasattr(reader, 'pages') else 0
+                if num_pages <= 0:
+                    print(f"[WARN] PDF {pdf_filename} has no pages, skipping attachment")
+                    try:
+                        pdf_path.unlink()
+                    except:
+                        pass
+                    pdf_attached = False
+                else:
+                    pdf_attached = True
+            except Exception as e:
+                print(f"[WARN] Could not read PDF {pdf_filename} before attaching: {e}")
+                pdf_attached = False
 
-        # Extract JSON
-        json_match = re.search(r'```json\s*(.*?)\s*```', content, re.DOTALL)
-        if json_match:
-            result = json.loads(json_match.group(1))
+        for model_name in gen_models_to_try:
+            print(f"[LLM-1] Trying model '{model_name}' for generation...")
+
+            def create_gen_model(api_key, model_name=model_name):
+                # Lazy import to avoid heavy transformer/torch dependencies during module import
+                from langchain_google_genai import ChatGoogleGenerativeAI
+                return ChatGoogleGenerativeAI(
+                    model=model_name,
+                    temperature=generation_config.get('temperature', 0.1),
+                    api_key=api_key
+                )
+
+            def call_gen_model(api_key, model_name=model_name, attach_pdf=True):
+                # Build the content for this call; copy message parts and optionally remove file part
+                content_parts = list(message_parts)
+                if not attach_pdf:
+                    content_parts = [p for p in content_parts if p.get('type') != 'file']
+                model = create_gen_model(api_key, model_name=model_name)
+                return model.invoke([HumanMessage(content=content_parts)])
+
+            try:
+                # First try with file if it was successfully validated and attached
+                if pdf_attached:
+                    try:
+                        gen_response = try_api_call_with_fallback(lambda api_key: call_gen_model(api_key, model_name=model_name, attach_pdf=True))
+                        used_gen_model = model_name
+                        print(f"[LLM-1] Model '{model_name}' succeeded for generation (with PDF)")
+                        break
+                    except Exception as e:
+                        # If the error indicates invalid document (e.g., 'The document has no pages.') retry once without the file
+                        msg = str(e)
+                        if 'INVALID_ARGUMENT' in msg or 'document has no pages' in msg.lower():
+                            print(f"[LLM-1] Model '{model_name}' rejected PDF: retrying without file")
+                            try:
+                                gen_response = try_api_call_with_fallback(lambda api_key: call_gen_model(api_key, model_name=model_name, attach_pdf=False))
+                                used_gen_model = model_name
+                                print(f"[LLM-1] Model '{model_name}' succeeded for generation (without PDF)")
+                                break
+                            except Exception as e2:
+                                last_exc = e2
+                                # Continue to next model
+                                print(f"[LLM-1] Retry without file also failed: {e2}")
+                                continue
+                        else:
+                            last_exc = e
+                            # For quota errors, try next model
+                            if 'RESOURCE_EXHAUSTED' in msg or 'quota' in msg.lower() or '429' in msg:
+                                print(f"[LLM-1] Model '{model_name}' resource/quota issue, trying next model...")
+                                continue
+                            else:
+                                # Non-quota, non-PDF errors should be surfaced
+                                raise
+                else:
+                    gen_response = try_api_call_with_fallback(lambda api_key: call_gen_model(api_key, model_name=model_name, attach_pdf=False))
+                    used_gen_model = model_name
+                    print(f"[LLM-1] Model '{model_name}' succeeded for generation (no PDF)")
+                    break
+
+            except Exception as e:
+                last_exc = e
+                msg = str(e)
+                if 'RESOURCE_EXHAUSTED' in msg or 'quota' in msg.lower() or '429' in msg:
+                    print(f"[LLM-1] Model '{model_name}' resource/quota issue, trying next model...")
+                    continue
+                else:
+                    # Non-quota errors should be surfaced
+                    raise
+
+        if gen_response is None:
+            raise Exception(f"Generation failed for all tried models. Last error: {last_exc}")
+
+        # Extract generation content
+        gen_content = gen_response.content if hasattr(gen_response, 'content') else str(gen_response)
+        if isinstance(gen_content, list):
+            gen_content = '\n'.join([block.get('text', '') if isinstance(block, dict) else str(block) for block in gen_content])
+
+        # Extract JSON from generation
+        gen_json_match = re.search(r'```json\s*(.*?)\s*```', gen_content, re.DOTALL)
+        if gen_json_match:
+            try:
+                generation_result = json.loads(gen_json_match.group(1))
+            except json.JSONDecodeError as e:
+                print(f"[ERROR] Failed to parse generation JSON: {e}")
+                print(f"[DEBUG] Raw generation content: {gen_content[:500]}...")
+                raise Exception(f"Generation JSON parsing failed: {e}")
         else:
-            result = json.loads(content.strip())
+            try:
+                generation_result = json.loads(gen_content.strip())
+            except json.JSONDecodeError as e:
+                print(f"[ERROR] Failed to parse generation content as JSON: {e}")
+                print(f"[DEBUG] Raw generation content: {gen_content[:500]}...")
+                raise Exception(f"Generation content parsing failed: {e}")
+
+        initial_signal = generation_result.get('final_signal', 0)
+        initial_confidence = generation_result.get('Confidence', 0)
+        explanation = generation_result.get('explanation', '')
+
+        print(f"[LLM-1] Initial result: Signal={initial_signal}, Confidence={initial_confidence}")
+
+        # ===== STEP 2: SIGNAL VALIDATION =====
+        print(f"[LLM-2] Validating signal with {validation_config['model']}...")
+
+        # Build validation prompt
+        validation_prompt = validation_config['prompt_template'].format(
+            signal=initial_signal,
+            explanation=explanation
+        )
+
+        # Try configured validation model first, then fall back to sensible defaults if quota / 429 occurs
+        val_primary = validation_config.get('model')
+        val_fallbacks = validation_config.get('fallback_models', [used_gen_model, "gemini-3-flash-preview", "gemini-2.5-flash"])
+        val_models_to_try = [m for m in ([val_primary] + val_fallbacks) if m]
+
+        val_response = None
+        last_val_exc = None
+        used_val_model = None
+
+        for model_name in val_models_to_try:
+            print(f"[LLM-2] Trying model '{model_name}' for validation...")
+
+            def create_val_model(api_key, model_name=model_name):
+                # Lazy import to avoid heavy transformer/torch dependencies during module import
+                from langchain_google_genai import ChatGoogleGenerativeAI
+                return ChatGoogleGenerativeAI(
+                    model=model_name,
+                    temperature=validation_config.get('temperature', 0.1),
+                    api_key=api_key
+                )
+
+            def call_val_model(api_key, model_name=model_name):
+                model = create_val_model(api_key, model_name=model_name)
+                return model.invoke([HumanMessage(content=[{"type": "text", "text": validation_prompt}])])
+
+            try:
+                val_response = try_api_call_with_fallback(call_val_model)
+                used_val_model = model_name
+                print(f"[LLM-2] Model '{model_name}' succeeded for validation")
+                break
+            except Exception as e:
+                last_val_exc = e
+                msg = str(e)
+                if 'RESOURCE_EXHAUSTED' in msg or 'quota' in msg.lower() or '429' in msg:
+                    print(f"[LLM-2] Model '{model_name}' resource/quota issue, trying next model...")
+                    continue
+                else:
+                    # Non-quota errors should be surfaced
+                    raise
+
+        if val_response is None:
+            raise Exception(f"Validation failed for all tried models. Last error: {last_val_exc}")
+
+        # Extract validation content
+        val_content = val_response.content if hasattr(val_response, 'content') else str(val_response)
+        if isinstance(val_content, list):
+            val_content = '\n'.join([block.get('text', '') if isinstance(block, dict) else str(block) for block in val_content])
+
+        # Extract JSON from validation
+        validation_success = False
+        validation_result = None
+
+        val_json_match = re.search(r'```json\s*(.*?)\s*```', val_content, re.DOTALL)
+        if val_json_match:
+            try:
+                validation_result = json.loads(val_json_match.group(1))
+                validation_success = True
+            except json.JSONDecodeError as e:
+                print(f"[ERROR] Failed to parse validation JSON: {e}")
+                print(f"[DEBUG] Raw validation content: {val_content[:500]}...")
+        else:
+            try:
+                validation_result = json.loads(val_content.strip())
+                validation_success = True
+            except json.JSONDecodeError as e:
+                print(f"[ERROR] Failed to parse validation content as JSON: {e}")
+                print(f"[DEBUG] Raw validation content: {val_content[:500]}...")
+
+        if validation_success and validation_result:
+            final_signal = validation_result.get('final_signal', initial_signal)
+            final_confidence = validation_result.get('Confidence', initial_confidence)
+            validation_reasoning = validation_result.get('explanation', '')
+            print(f"[LLM-2] Final result: Signal={final_signal}, Confidence={final_confidence}")
+        else:
+            # Fallback to generation result if validation parsing failed
+            print(f"[WARN] Validation parsing failed, using generation result as final signal")
+            final_signal = initial_signal
+            final_confidence = initial_confidence
+            validation_reasoning = "Validation parsing failed - using generation result"
+            print(f"[LLM-2] Fallback result: Signal={final_signal}, Confidence={final_confidence}")
 
         # Cleanup PDF
         if pdf_path and pdf_path.exists():
@@ -271,10 +525,15 @@ Return ONLY JSON in this format:
             except:
                 pass
 
-        return result
+        # Return final result (validated or fallback)
+        return {
+            "final_signal": final_signal,
+            "Confidence": final_confidence,
+            "explanation": f"{explanation}\n\n[VALIDATION]: {validation_reasoning}"
+        }
 
     except Exception as e:
-        print(f"[ERROR] Signal generation failed: {e}")
+        print(f"[ERROR] Signal generation/validation failed: {e}")
 
         # Cleanup PDF on error
         if pdf_filename:
@@ -287,7 +546,6 @@ Return ONLY JSON in this format:
                     pass
 
         return {"final_signal": 0, "Confidence": 0, "explanation": f"Error: {str(e)}"}
-
 
 def process_filing(announcement: dict) -> dict:
     """

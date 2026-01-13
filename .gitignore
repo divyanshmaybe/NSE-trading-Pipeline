@@ -42,3 +42,17 @@ processed_announcements.json
 
 # Trading signals
 trading_signals.jsonl
+
+# API key exhaustion tracking
+exhausted_keys.json
+
+# Debug and test files
+debug/
+ex.py
+list_*.py
+test_*.py
+smoke_test_*.py
+
+# Virtual environments (additional patterns)
+.venv/
+pyvenv.cfg

@@ -1,21 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-NSE Trading Signal Monitor with WhatsApp Alerts
+NSE Trading Signal Monitor (Telegram by default)
 
-This script integrates the NSE scraper and signal generator to:
-1. Poll NSE announcements every minute
-2. Generate trading signals using LLM
-3. Send actionable signals (BUY/SELL) to WhatsApp via Twilio
+Integrates NSE scraper and signal generator to poll announcements, generate signals, and send notifications.
 
-Usage:
-    python nse_whatsapp_monitor.py
-
-Environment Variables Required:
+Environment Variables:
     GEMINI_API_KEY: Google Gemini API key for LLM
-    TWILIO_ACCOUNT_SID: Twilio account SID
-    TWILIO_AUTH_TOKEN: Twilio auth token
-    TWILIO_WHATSAPP_FROM: Twilio WhatsApp number (e.g., whatsapp:+14155238886)
-    TWILIO_WHATSAPP_TO: Your WhatsApp number (e.g., whatsapp:+919876543210)
+    TELEGRAM_BOT_TOKEN: Telegram bot token for notifications (required)
+    TELEGRAM_CHAT_IDS: Comma-separated Telegram chat IDs to send messages to
     DEMO_MODE: Set to 'true' to run 24/7 (default: false for market hours only)
 """
 
@@ -29,26 +21,41 @@ from pathlib import Path
 from typing import Optional, Dict, List
 from dotenv import load_dotenv
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('nse_monitor.log'),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
+import io as _io
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+file_handler = logging.FileHandler('nse_monitor.log', encoding='utf-8')
+file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+
+stream_handler = logging.StreamHandler(sys.stdout)
+try:
+    stream_handler.setStream(_io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True))
+except Exception:
+    try:
+        if hasattr(sys.stdout, 'reconfigure'):
+            sys.stdout.reconfigure(encoding='utf-8')
+            stream_handler = logging.StreamHandler(sys.stdout)
+    except Exception:
+        pass
+
+stream_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+
+if not logger.handlers:
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
 
 # Load environment variables
 load_dotenv()
 
-# Import Twilio
+# Import Telegram notifier (preferred)
 try:
-    from twilio.rest import Client
-except ImportError:
-    logger.error("Twilio not installed. Run: pip install twilio")
-    sys.exit(1)
+    from telegram_notifier import TelegramNotifier
+    TELEGRAM_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"Telegram notifier not available: {e}")
+    TelegramNotifier = None
+    TELEGRAM_AVAILABLE = False
 
 # Add project paths for imports
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -70,11 +77,6 @@ except ImportError as e:
 POLL_INTERVAL = 60  # Poll every 1 minute
 DEMO_MODE = os.getenv("DEMO_MODE", "false").lower() in {"1", "true", "yes"}
 
-# Twilio Configuration
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
-TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM", "")  # e.g., whatsapp:+14155238886
-TWILIO_WHATSAPP_TO = os.getenv("TWILIO_WHATSAPP_TO", "")  # e.g., whatsapp:+919876543210
 
 # Market hours (IST)
 MARKET_OPEN = (9, 15)  # 9:15 AM
@@ -84,144 +86,10 @@ MARKET_CLOSE = (15, 30)  # 3:30 PM
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 
-# ============================================================================
-# TWILIO WHATSAPP CLIENT
-# ============================================================================
+# NOTE: Legacy Twilio/WhatsApp support has been removed.
+# Telegram is the only supported notifier now.
 
-class WhatsAppNotifier:
-    """Send WhatsApp messages via Twilio"""
-    
-    def __init__(self):
-        self.validate_config()
-        self.client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        logger.info(f"✅ WhatsApp notifier initialized: {TWILIO_WHATSAPP_FROM} -> {TWILIO_WHATSAPP_TO}")
-    
-    def validate_config(self):
-        """Validate Twilio configuration"""
-        missing = []
-        if not TWILIO_ACCOUNT_SID:
-            missing.append("TWILIO_ACCOUNT_SID")
-        if not TWILIO_AUTH_TOKEN:
-            missing.append("TWILIO_AUTH_TOKEN")
-        if not TWILIO_WHATSAPP_FROM:
-            missing.append("TWILIO_WHATSAPP_FROM")
-        if not TWILIO_WHATSAPP_TO:
-            missing.append("TWILIO_WHATSAPP_TO")
-        
-        if missing:
-            raise ValueError(f"Missing Twilio config: {', '.join(missing)}")
-        
-        # Validate WhatsApp number format
-        if not TWILIO_WHATSAPP_FROM.startswith("whatsapp:"):
-            raise ValueError("TWILIO_WHATSAPP_FROM must start with 'whatsapp:' (e.g., whatsapp:+14155238886)")
-        if not TWILIO_WHATSAPP_TO.startswith("whatsapp:"):
-            raise ValueError("TWILIO_WHATSAPP_TO must start with 'whatsapp:' (e.g., whatsapp:+919876543210)")
-    
-    def send_signal(self, signal_data: Dict) -> bool:
-        """
-        Send trading signal to WhatsApp
-        
-        Args:
-            signal_data: Dict with keys: symbol, signal, confidence, explanation, 
-                        filing_time, subject_of_announcement, reference_price
-        
-        Returns:
-            True if sent successfully, False otherwise
-        """
-        try:
-            symbol = signal_data.get('symbol', 'UNKNOWN')
-            signal = signal_data.get('signal', 0)
-            confidence = signal_data.get('confidence', 0.0)
-            explanation = signal_data.get('explanation', 'No explanation')
-            filing_time = signal_data.get('filing_time', 'Unknown')
-            subject = signal_data.get('subject_of_announcement', 'Unknown')
-            price = signal_data.get('reference_price')
-            
-            # Format signal emoji
-            signal_emoji = "🟢 BUY" if signal == 1 else "🔴 SELL" if signal == -1 else "⚪ HOLD"
-            
-            # Format confidence as percentage
-            confidence_pct = f"{confidence * 100:.1f}%"
-            
-            # Format price
-            price_str = f"₹{price:.2f}" if price else "N/A"
-            
-            # Build message
-            message = f"""
-🚨 *NSE TRADING SIGNAL* 🚨
 
-*Symbol:* {symbol}
-*Action:* {signal_emoji}
-*Confidence:* {confidence_pct}
-*Current Price:* {price_str}
-
-*Filing Type:* {subject}
-*Time:* {filing_time}
-
-*Analysis:*
-{explanation[:500]}{"..." if len(explanation) > 500 else ""}
-
----
-⚠️ This is automated analysis. Trade at your own risk.
-""".strip()
-            
-            # Send via Twilio
-            logger.info(f"📱 Sending WhatsApp message for {symbol} ({signal_emoji})...")
-            msg = self.client.messages.create(
-                from_=TWILIO_WHATSAPP_FROM,
-                body=message,
-                to=TWILIO_WHATSAPP_TO
-            )
-            
-            logger.info(f"✅ WhatsApp sent successfully: SID={msg.sid}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Failed to send WhatsApp: {e}")
-            return False
-    
-    def send_startup_message(self):
-        """Send startup notification"""
-        try:
-            mode = "DEMO MODE (24/7)" if DEMO_MODE else "MARKET HOURS ONLY"
-            message = f"""
-🤖 *NSE Signal Monitor Started*
-
-Mode: {mode}
-Polling: Every {POLL_INTERVAL} seconds
-Market Hours: {MARKET_OPEN[0]}:{MARKET_OPEN[1]:02d} - {MARKET_CLOSE[0]}:{MARKET_CLOSE[1]:02d} IST
-
-Ready to monitor NSE filings! 🚀
-""".strip()
-            
-            self.client.messages.create(
-                from_=TWILIO_WHATSAPP_FROM,
-                body=message,
-                to=TWILIO_WHATSAPP_TO
-            )
-            logger.info("✅ Startup notification sent")
-        except Exception as e:
-            logger.warning(f"⚠️ Could not send startup notification: {e}")
-    
-    def send_error_alert(self, error_msg: str):
-        """Send error alert"""
-        try:
-            message = f"""
-⚠️ *NSE Monitor Error*
-
-{error_msg}
-
-Monitor may need attention.
-""".strip()
-            
-            self.client.messages.create(
-                from_=TWILIO_WHATSAPP_FROM,
-                body=message,
-                to=TWILIO_WHATSAPP_TO
-            )
-            logger.info("✅ Error alert sent")
-        except Exception as e:
-            logger.warning(f"⚠️ Could not send error alert: {e}")
 
 
 # ============================================================================
@@ -255,13 +123,30 @@ def is_market_open() -> bool:
 # ============================================================================
 
 class NSESignalMonitor:
-    """Main monitor that polls NSE and sends WhatsApp alerts"""
+    """Main monitor that polls NSE and sends notifications"""
 
-    def __init__(self):
-        self.whatsapp = WhatsAppNotifier()
+    def __init__(self, dry_run: bool = False):
+        # Initialize Telegram notifier (required for notifications)
+        if TELEGRAM_AVAILABLE:
+            try:
+                self.notifier = TelegramNotifier(dry_run=dry_run)
+                self.notification_type = "Telegram"
+            except Exception as e:
+                logger.warning(f"Telegram notifier failed: {e}")
+                if not dry_run:
+                    # If not in dry-run and Telegram init fails, surface the error
+                    raise
+                self.notifier = None
+                self.notification_type = "None (dry-run)"
+        else:
+            # Telegram must be configured; without it notifications are disabled
+            logger.warning("Telegram notifier is not available; notifications will be disabled")
+            self.notifier = None
+            self.notification_type = "None"
+
         self.seen_announcements = set()
         self.load_seen_announcements()
-        logger.info("✅ NSE Signal Monitor initialized")
+        logger.info(f"✅ NSE Signal Monitor initialized (notifications: {self.notification_type})")
 
     def load_seen_announcements(self):
         """Load previously seen announcement IDs"""
@@ -316,7 +201,8 @@ class NSESignalMonitor:
         logger.info(f"⏱️ Polling interval: {POLL_INTERVAL} seconds")
         
         # Send startup notification
-        self.whatsapp.send_startup_message()
+        if self.notifier:
+            self.notifier.send_startup_message()
         
         error_count = 0
         max_errors = 5
@@ -333,20 +219,27 @@ class NSESignalMonitor:
                 
                 # Poll for new announcements
                 announcements = self.poll_nse()
-                
+
                 if not announcements:
                     logger.info("📭 No new announcements")
                     time.sleep(POLL_INTERVAL)
                     continue
+
+                # Debug: Show what announcements were found
+                logger.info(f"📋 Processing {len(announcements)} new announcements:")
+                for i, ann in enumerate(announcements[:5], 1):  # Show first 5
+                    logger.info(f"   {i}. {ann.get('symbol', 'N/A')}: {ann.get('desc', 'N/A')[:60]}...")
+                if len(announcements) > 5:
+                    logger.info(f"   ... and {len(announcements) - 5} more")
                 
                 # Process announcements and get signals
                 signals = process_announcements(announcements)
 
-                # Send WhatsApp notifications for each signal
+                # Send notifications for each signal
                 for signal_data in signals:
                     try:
-                        logger.info(f"📱 Sending WhatsApp for {signal_data['symbol']}...")
-                        success = self.whatsapp.send_signal(signal_data)
+                        logger.info(f"📱 Sending notification for {signal_data['symbol']}...")
+                        success = self.notifier.send_signal(signal_data) if self.notifier else False
 
                         if success:
                             logger.info(f"✅ Signal sent for {signal_data['symbol']}")
@@ -354,7 +247,7 @@ class NSESignalMonitor:
                             logger.warning(f"⚠️ Failed to send signal for {signal_data['symbol']}")
 
                     except Exception as e:
-                        logger.error(f"❌ Error sending WhatsApp for {signal_data.get('symbol', 'unknown')}: {e}", exc_info=True)
+                        logger.error(f"❌ Error sending notification for {signal_data.get('symbol', 'unknown')}: {e}", exc_info=True)
                         continue
                 
                 # Save seen announcements
@@ -378,7 +271,8 @@ class NSESignalMonitor:
                 
                 if error_count >= max_errors:
                     logger.critical("🚨 Too many errors - sending alert and stopping")
-                    self.whatsapp.send_error_alert(f"Monitor crashed after {max_errors} errors: {e}")
+                    if self.notifier:
+                        self.notifier.send_error_alert(f"Monitor crashed after {max_errors} errors: {e}")
                     break
                 
                 # Exponential backoff on errors
@@ -393,14 +287,21 @@ class NSESignalMonitor:
 
 def main():
     """Main entry point"""
-    
-    # Validate API keys
-    if not GEMINI_API_KEY:
-        logger.error("❌ GEMINI_API_KEY not set in environment")
+    import argparse
+
+    parser = argparse.ArgumentParser(description='NSE Signal Monitor')
+    parser.add_argument('--dry-run', action='store_true', help='Run in dry-run mode (no external notifications/LLM calls)')
+    args = parser.parse_args()
+
+    dry_run = args.dry_run or os.getenv('DRY_RUN', '').lower() in {'1', 'true', 'yes'}
+
+    # Validate API keys (if not in dry-run)
+    if not dry_run and not GEMINI_API_KEY and not os.getenv("GEMINI_API_KEYS"):
+        logger.error("❌ GEMINI_API_KEY or GEMINI_API_KEYS not set in environment")
         sys.exit(1)
-    
+
     # Create and run monitor
-    monitor = NSESignalMonitor()
+    monitor = NSESignalMonitor(dry_run=dry_run)
     monitor.run()
 
 

@@ -1,32 +1,23 @@
-# -*- coding: utf-8 -*-
-"""
-Simplified NSE Web Scraper for WhatsApp Notifications
-
-This module scrapes NSE corporate filings announcements and processes them
-for trading signals without complex infrastructure dependencies.
-"""
-
 import os
 import time
 import json
+import gzip
 import requests
 from datetime import datetime
 from typing import List, Dict
 from nse_sentiment import process_filing
 
-
-# Relevant file types
 RELEVANT_FILE_TYPES = {
-    "Outcome of Board Meeting": {"positive": True, "negative": True},
-    "Press Release": {"positive": True, "negative": False},
-    "Appointment": {"positive": True, "negative": True},
-    "Acquisition": {"positive": True, "negative": True},
-    "Updates": {"positive": True, "negative": True},
-    "Action(s) initiated or orders passed": {"positive": True, "negative": True},
-    "Investor Presentation": {"positive": True, "negative": True},
-    "Sale or Disposal": {"positive": True, "negative": True},
-    "Bagging/Receiving of Orders/Contracts": {"positive": True, "negative": True},
-    "Change in Director(s)": {"positive": True, "negative": True},
+    "Outcome of Board Meeting",
+    "Press Release",
+    "Appointment",
+    "Acquisition",
+    "Updates",
+    "Action(s) initiated or orders passed",
+    "Investor Presentation",
+    "Sale or Disposal",
+    "Bagging/Receiving of Orders/Contracts",
+    "Change in Director(s)",
 }
 
 NSE_BASE_URL = "https://www.nseindia.com"
@@ -51,34 +42,72 @@ def get_session_headers() -> Dict[str, str]:
 
 
 def fetch_nse_announcements() -> List[Dict]:
-    """Fetch announcements from NSE API"""
     try:
         session = requests.Session()
         headers = get_session_headers()
-
-        # Establish session
-        print("[NSE] Establishing NSE session...")
         session.get(NSE_BASE_URL, headers=headers, timeout=20)
         time.sleep(1)
         session.get(f"{NSE_BASE_URL}/companies-listing/corporate-filings-announcements", headers=headers, timeout=20)
         time.sleep(1)
 
-        # Fetch announcements
-        print("[NSE] Fetching announcements from API...")
-        response = session.get(NSE_API_URL, headers=headers, timeout=30)
+        headers_no_accept_encoding = headers.copy()
+        headers_no_accept_encoding['Accept-Encoding'] = 'identity'
+        response = session.get(NSE_API_URL, headers=headers_no_accept_encoding, timeout=30)
         response.raise_for_status()
 
-        data = response.json()
-        if not isinstance(data, list):
-            print(f"[WARN] Unexpected API response format")
+        content_encoding = response.headers.get('Content-Encoding', 'none')
+        if content_encoding == 'gzip' or response.content.startswith(b'\x1f\x8b'):
+            try:
+                decompressed = gzip.decompress(response.content)
+                json_text = decompressed.decode('utf-8')
+            except Exception:
+                return []
+        elif content_encoding == 'br':
+            try:
+                try:
+                    import brotli as _brotli
+                    decompressed = _brotli.decompress(response.content)
+                except ImportError:
+                    try:
+                        import brotlicffi as _brotlicffi
+                        decompressed = _brotlicffi.decompress(response.content)
+                    except ImportError:
+                        try:
+                            json_text = response.text
+                        except Exception:
+                            return []
+                json_text = decompressed.decode('utf-8')
+            except Exception:
+                return []
+        else:
+            try:
+                json_text = response.content.decode('utf-8')
+            except UnicodeDecodeError:
+                return []
+
+        if not json_text.strip():
             return []
 
-        print(f"[NSE] Fetched {len(data)} announcements")
+        data = json.loads(json_text)
+        if not isinstance(data, list):
+            return []
 
-        # Convert to our format
+        from datetime import datetime, timedelta
+        now = datetime.now()
+        five_minutes_ago = now - timedelta(minutes=5)
+
         announcements = []
         for item in data:
             try:
+                an_dt_str = item.get('an_dt', '')
+                if an_dt_str:
+                    try:
+                        an_dt = datetime.strptime(an_dt_str, '%d-%b-%Y %H:%M:%S')
+                        if an_dt < five_minutes_ago:
+                            continue
+                    except ValueError:
+                        pass
+
                 announcement = {
                     'symbol': item.get('symbol', ''),
                     'desc': item.get('desc', ''),
@@ -93,36 +122,21 @@ def fetch_nse_announcements() -> List[Dict]:
                     'fileSize': item.get('fileSize', ''),
                 }
                 announcements.append(announcement)
-            except Exception as e:
-                print(f"[WARN] Failed to process announcement: {e}")
+            except Exception:
                 continue
 
         return announcements
 
-    except Exception as e:
-        print(f"[ERROR] Failed to fetch NSE announcements: {e}")
+    except Exception:
         return []
 
 
 def is_relevant_announcement(announcement: Dict) -> bool:
-    """Check if announcement is relevant for processing"""
-    desc = announcement.get('desc', '').lower()
+    desc = announcement.get('desc', '').strip().lower()
     pdf_url = announcement.get('attchmntFile', '')
-
-    # Must have PDF attachment
     if not pdf_url or not pdf_url.strip():
         return False
-
-    # Check if description contains relevant keywords
-    relevant_keywords = [
-        'board meeting', 'press release', 'appointment', 'acquisition',
-        'financial results', 'quarterly results', 'annual report',
-        'investor presentation', 'change in director', 'dividend',
-        'bonus', 'rights issue', 'merger', 'amalgamation', 'outcome',
-        'corporate action', 'insider trading', 'shareholding'
-    ]
-
-    return any(keyword in desc for keyword in relevant_keywords)
+    return desc in {k.lower() for k in RELEVANT_FILE_TYPES}
 
 
 def process_announcements(announcements: List[Dict]) -> List[Dict]:
@@ -172,7 +186,7 @@ def main():
 
     print(f"[END] Generated {len(signals)} trading signals")
 
-    # In a real implementation, you would send these signals to WhatsApp
+    # In a real implementation, you would send these signals through the configured notifier (Telegram)
     # For now, just print them
     for signal in signals:
         print(f"SIGNAL: {signal}")
